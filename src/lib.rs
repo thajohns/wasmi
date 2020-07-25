@@ -235,6 +235,12 @@ pub enum TrapKind {
     /// [`Signature`]: struct.Signature.html
     UnexpectedSignature,
 
+    /// The interpreter has exceeded its quota of instructions.
+    ///
+    /// This happens if and only if the interpreter's instruction counter will exceed the
+    /// specified maximum when another instruction is run.
+    TooManyInstructions,
+
     /// Error specified by the host.
     ///
     /// Typically returned from an implementation of [`Externals`].
@@ -249,6 +255,15 @@ impl TrapKind {
         match self {
             &TrapKind::Host(_) => true,
             _ => false,
+        }
+    }
+
+    /// Whether execution can be resumed after handling this trap.
+    pub fn is_recoverable(&self) -> bool {
+        match self {
+            &TrapKind::TooManyInstructions => true,
+            x if x.is_host() => true,
+            _ => false
         }
     }
 }

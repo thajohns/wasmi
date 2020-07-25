@@ -143,7 +143,7 @@ impl FuncInstance {
         match *func.as_internal() {
             FuncInstanceInternal::Internal { .. } => {
                 let mut interpreter = Interpreter::new(func, args, None)?;
-                interpreter.start_execution(externals)
+                interpreter.start_execution_until(externals, None)
             }
             FuncInstanceInternal::Host {
                 ref host_func_index,
@@ -169,7 +169,7 @@ impl FuncInstance {
         match *func.as_internal() {
             FuncInstanceInternal::Internal { .. } => {
                 let mut interpreter = Interpreter::new(func, args, Some(stack_recycler))?;
-                let return_value = interpreter.start_execution(externals);
+                let return_value = interpreter.start_execution_until(externals, None);
                 stack_recycler.recycle(interpreter);
                 return_value
             }
@@ -252,6 +252,7 @@ impl From<Trap> for ResumableError {
 }
 
 /// A resumable invocation handle. This struct is returned by `FuncInstance::invoke_resumable`.
+/// This additionally stores the step counter of the interpreter.
 pub struct FuncInvocation<'args> {
     kind: FuncInvocationKind<'args>,
 }
@@ -290,12 +291,22 @@ impl<'args> FuncInvocation<'args> {
         &mut self,
         externals: &'externals mut E,
     ) -> Result<Option<RuntimeValue>, ResumableError> {
+        self.start_execution_until(externals, None)
+    }
+
+    /// Start the invocation execution, but stop when the instruction counter reaches the specified
+    /// maximum and cause an OutOfSteps trap.
+    pub fn start_execution_until<'externals, E: Externals + 'externals>(
+        &mut self,
+        externals: &'externals mut E,
+        count_max: Option<isize>,
+    ) -> Result<Option<RuntimeValue>, ResumableError> {
         match self.kind {
             FuncInvocationKind::Internal(ref mut interpreter) => {
                 if interpreter.state() != &InterpreterState::Initialized {
                     return Err(ResumableError::AlreadyStarted);
                 }
-                Ok(interpreter.start_execution(externals)?)
+                Ok(interpreter.start_execution_until(externals, count_max)?)
             }
             FuncInvocationKind::Host {
                 ref args,
@@ -311,7 +322,7 @@ impl<'args> FuncInvocation<'args> {
         }
     }
 
-    /// Resume an execution if a previous trap of Host kind happened.
+    /// Resume an execution if a previous trap of Host or OutOfSteps kind happened.
     ///
     /// `return_val` must be of the value type [`resumable_value_type`], defined by the host function import. Otherwise,
     /// `UnexpectedSignature` trap will be returned. The current invocation must also be resumable
@@ -324,6 +335,17 @@ impl<'args> FuncInvocation<'args> {
         return_val: Option<RuntimeValue>,
         externals: &'externals mut E,
     ) -> Result<Option<RuntimeValue>, ResumableError> {
+        self.resume_execution_until(return_val, externals, None)
+    }
+
+    /// Resume an execution if a previous trap of Host or OutOfSteps kind happened, but bound the
+    /// step count before an OutOfSteps trap will happen.
+    pub fn resume_execution_until<'externals, E: Externals + 'externals>(
+        &mut self,
+        return_val: Option<RuntimeValue>,
+        externals: &'externals mut E,
+        count_max: Option<isize>,
+    ) -> Result<Option<RuntimeValue>, ResumableError> {
         use crate::TrapKind;
 
         if return_val.map(|v| v.value_type()) != self.resumable_value_type() {
@@ -335,13 +357,39 @@ impl<'args> FuncInvocation<'args> {
         match &mut self.kind {
             FuncInvocationKind::Internal(interpreter) => {
                 if interpreter.state().is_resumable() {
-                    Ok(interpreter.resume_execution(return_val, externals)?)
+                    Ok(interpreter.resume_execution_until(return_val, externals, count_max)?)
                 } else {
                     Err(ResumableError::AlreadyStarted)
                 }
             }
             FuncInvocationKind::Host { .. } => Err(ResumableError::NotResumable),
         }
+    }
+
+    /// Returns the current step counter.
+    pub fn counter(&self) -> isize {
+        match &self.kind {
+            FuncInvocationKind::Internal(interpreter) => interpreter.counter(),
+            _ => 0,
+        }
+    }
+
+    /// Sets the step counter.
+    pub fn set_counter(&mut self, count: isize) {
+        match &mut self.kind {
+            FuncInvocationKind::Internal(interpreter) => interpreter.set_counter(count),
+            _ => (),
+        }
+    }
+
+    /// Resets the step counter to zero.
+    pub fn reset_counter(&mut self) {
+        self.set_counter(0);
+    }
+    
+    /// Adds an offset to the step counter.
+    pub fn add_counter(&mut self, addend: isize) {
+        self.set_counter(self.counter() + addend);
     }
 }
 

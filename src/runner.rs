@@ -140,8 +140,8 @@ pub enum InterpreterState {
     Initialized,
     /// The interpreter has started execution, and cannot be called again if it exits normally, or no Host traps happened.
     Started,
-    /// The interpreter has been executed, and returned a Host trap. It can resume execution by providing back a return
-    /// value.
+    /// The interpreter has been executed, and returned a Host or resumable trap. It can resume
+    /// execution by providing back a return value.
     Resumable(Option<ValueType>),
 }
 
@@ -168,6 +168,7 @@ pub struct Interpreter {
     call_stack: CallStack,
     return_type: Option<ValueType>,
     state: InterpreterState,
+    instr_count: isize,
 }
 
 impl Interpreter {
@@ -197,6 +198,7 @@ impl Interpreter {
             call_stack,
             return_type,
             state: InterpreterState::Initialized,
+            instr_count: 0,
         })
     }
 
@@ -204,15 +206,24 @@ impl Interpreter {
         &self.state
     }
 
-    pub fn start_execution<'a, E: Externals + 'a>(
+    pub fn counter(&self) -> isize {
+        self.instr_count
+    }
+
+    pub fn set_counter(&mut self, counter: isize) {
+        self.instr_count = counter;
+    }
+
+    pub fn start_execution_until<'a, E: Externals + 'a>(
         &mut self,
         externals: &'a mut E,
+        count_max: Option<isize>,
     ) -> Result<Option<RuntimeValue>, Trap> {
         // Ensure that the VM has not been executed. This is checked in `FuncInvocation::start_execution`.
         assert!(self.state == InterpreterState::Initialized);
 
         self.state = InterpreterState::Started;
-        self.run_interpreter_loop(externals)?;
+        self.run_interpreter_loop(externals, count_max)?;
 
         let opt_return_value = self
             .return_type
@@ -224,10 +235,11 @@ impl Interpreter {
         Ok(opt_return_value)
     }
 
-    pub fn resume_execution<'a, E: Externals + 'a>(
+    pub fn resume_execution_until<'a, E: Externals + 'a>(
         &mut self,
         return_val: Option<RuntimeValue>,
         externals: &'a mut E,
+        count_max: Option<isize>,
     ) -> Result<Option<RuntimeValue>, Trap> {
         use core::mem::swap;
 
@@ -243,7 +255,7 @@ impl Interpreter {
                 .map_err(Trap::new)?;
         }
 
-        self.run_interpreter_loop(externals)?;
+        self.run_interpreter_loop(externals, count_max)?;
 
         let opt_return_value = self
             .return_type
@@ -258,6 +270,7 @@ impl Interpreter {
     fn run_interpreter_loop<'a, E: Externals + 'a>(
         &mut self,
         externals: &'a mut E,
+        count_max: Option<isize>,
     ) -> Result<(), Trap> {
         loop {
             let mut function_context = self.call_stack.pop().expect(
@@ -275,9 +288,18 @@ impl Interpreter {
                 function_context.initialize(&function_body.locals, &mut self.value_stack)?;
             }
 
-            let function_return = self
-                .do_run_function(&mut function_context, &function_body.code)
-                .map_err(Trap::new)?;
+            let function_return_result = self
+                .do_run_function(&mut function_context, &function_body.code, count_max);
+            let function_return = match function_return_result {
+                Ok(r) => r,
+                Err(e) => {
+                    if e.is_recoverable() {
+                        self.call_stack.push(function_context);
+                        self.state = InterpreterState::Resumable(None);
+                    }
+                    return Err(Trap::new(e));
+                }
+            };
 
             match function_return {
                 RunResult::Return => {
@@ -339,17 +361,19 @@ impl Interpreter {
         &mut self,
         function_context: &mut FunctionContext,
         instructions: &isa::Instructions,
+        count_max: Option<isize>,
     ) -> Result<RunResult, TrapKind> {
         let mut iter = instructions.iterate_from(function_context.position);
 
         loop {
+            function_context.position = iter.position();
             let instruction = iter.next().expect(
                 "Ran out of instructions, this should be impossible \
                  since validation ensures that we either have an explicit \
                  return or an implicit block `end`.",
             );
 
-            match self.run_instruction(function_context, &instruction)? {
+            match self.run_instruction(function_context, &instruction, count_max)? {
                 InstructionOutcome::RunNextInstruction => {}
                 InstructionOutcome::Branch(target) => {
                     iter = instructions.iterate_from(target.dst_pc);
@@ -374,219 +398,225 @@ impl Interpreter {
         &mut self,
         context: &mut FunctionContext,
         instruction: &isa::Instruction,
+        count_max: Option<isize>,
     ) -> Result<InstructionOutcome, TrapKind> {
-        match instruction {
-            &isa::Instruction::Unreachable => self.run_unreachable(context),
+        if count_max.map_or(false, |max| self.instr_count >= max) {
+            Err(TrapKind::TooManyInstructions)
+        } else {
+            self.instr_count += 1;
+            match instruction {
+                &isa::Instruction::Unreachable => self.run_unreachable(context),
 
-            &isa::Instruction::Br(target) => self.run_br(context, target.clone()),
-            &isa::Instruction::BrIfEqz(target) => self.run_br_eqz(target.clone()),
-            &isa::Instruction::BrIfNez(target) => self.run_br_nez(target.clone()),
-            &isa::Instruction::BrTable(targets) => self.run_br_table(targets),
-            &isa::Instruction::Return(drop_keep) => self.run_return(drop_keep),
+                &isa::Instruction::Br(target) => self.run_br(context, target.clone()),
+                &isa::Instruction::BrIfEqz(target) => self.run_br_eqz(target.clone()),
+                &isa::Instruction::BrIfNez(target) => self.run_br_nez(target.clone()),
+                &isa::Instruction::BrTable(targets) => self.run_br_table(targets),
+                &isa::Instruction::Return(drop_keep) => self.run_return(drop_keep),
 
-            &isa::Instruction::Call(index) => self.run_call(context, index),
-            &isa::Instruction::CallIndirect(index) => self.run_call_indirect(context, index),
+                &isa::Instruction::Call(index) => self.run_call(context, index),
+                &isa::Instruction::CallIndirect(index) => self.run_call_indirect(context, index),
 
-            &isa::Instruction::Drop => self.run_drop(),
-            &isa::Instruction::Select => self.run_select(),
+                &isa::Instruction::Drop => self.run_drop(),
+                &isa::Instruction::Select => self.run_select(),
 
-            &isa::Instruction::GetLocal(depth) => self.run_get_local(depth),
-            &isa::Instruction::SetLocal(depth) => self.run_set_local(depth),
-            &isa::Instruction::TeeLocal(depth) => self.run_tee_local(depth),
-            &isa::Instruction::GetGlobal(index) => self.run_get_global(context, index),
-            &isa::Instruction::SetGlobal(index) => self.run_set_global(context, index),
+                &isa::Instruction::GetLocal(depth) => self.run_get_local(depth),
+                &isa::Instruction::SetLocal(depth) => self.run_set_local(depth),
+                &isa::Instruction::TeeLocal(depth) => self.run_tee_local(depth),
+                &isa::Instruction::GetGlobal(index) => self.run_get_global(context, index),
+                &isa::Instruction::SetGlobal(index) => self.run_set_global(context, index),
 
-            &isa::Instruction::I32Load(offset) => self.run_load::<i32>(context, offset),
-            &isa::Instruction::I64Load(offset) => self.run_load::<i64>(context, offset),
-            &isa::Instruction::F32Load(offset) => self.run_load::<F32>(context, offset),
-            &isa::Instruction::F64Load(offset) => self.run_load::<F64>(context, offset),
-            &isa::Instruction::I32Load8S(offset) => {
-                self.run_load_extend::<i8, i32>(context, offset)
+                &isa::Instruction::I32Load(offset) => self.run_load::<i32>(context, offset),
+                &isa::Instruction::I64Load(offset) => self.run_load::<i64>(context, offset),
+                &isa::Instruction::F32Load(offset) => self.run_load::<F32>(context, offset),
+                &isa::Instruction::F64Load(offset) => self.run_load::<F64>(context, offset),
+                &isa::Instruction::I32Load8S(offset) => {
+                    self.run_load_extend::<i8, i32>(context, offset)
+                }
+                &isa::Instruction::I32Load8U(offset) => {
+                    self.run_load_extend::<u8, i32>(context, offset)
+                }
+                &isa::Instruction::I32Load16S(offset) => {
+                    self.run_load_extend::<i16, i32>(context, offset)
+                }
+                &isa::Instruction::I32Load16U(offset) => {
+                    self.run_load_extend::<u16, i32>(context, offset)
+                }
+                &isa::Instruction::I64Load8S(offset) => {
+                    self.run_load_extend::<i8, i64>(context, offset)
+                }
+                &isa::Instruction::I64Load8U(offset) => {
+                    self.run_load_extend::<u8, i64>(context, offset)
+                }
+                &isa::Instruction::I64Load16S(offset) => {
+                    self.run_load_extend::<i16, i64>(context, offset)
+                }
+                &isa::Instruction::I64Load16U(offset) => {
+                    self.run_load_extend::<u16, i64>(context, offset)
+                }
+                &isa::Instruction::I64Load32S(offset) => {
+                    self.run_load_extend::<i32, i64>(context, offset)
+                }
+                &isa::Instruction::I64Load32U(offset) => {
+                    self.run_load_extend::<u32, i64>(context, offset)
+                }
+
+                &isa::Instruction::I32Store(offset) => self.run_store::<i32>(context, offset),
+                &isa::Instruction::I64Store(offset) => self.run_store::<i64>(context, offset),
+                &isa::Instruction::F32Store(offset) => self.run_store::<F32>(context, offset),
+                &isa::Instruction::F64Store(offset) => self.run_store::<F64>(context, offset),
+                &isa::Instruction::I32Store8(offset) => self.run_store_wrap::<i32, i8>(context, offset),
+                &isa::Instruction::I32Store16(offset) => {
+                    self.run_store_wrap::<i32, i16>(context, offset)
+                }
+                &isa::Instruction::I64Store8(offset) => self.run_store_wrap::<i64, i8>(context, offset),
+                &isa::Instruction::I64Store16(offset) => {
+                    self.run_store_wrap::<i64, i16>(context, offset)
+                }
+                &isa::Instruction::I64Store32(offset) => {
+                    self.run_store_wrap::<i64, i32>(context, offset)
+                }
+
+                &isa::Instruction::CurrentMemory => self.run_current_memory(context),
+                &isa::Instruction::GrowMemory => self.run_grow_memory(context),
+
+                &isa::Instruction::I32Const(val) => self.run_const(val.into()),
+                &isa::Instruction::I64Const(val) => self.run_const(val.into()),
+                &isa::Instruction::F32Const(val) => self.run_const(val.into()),
+                &isa::Instruction::F64Const(val) => self.run_const(val.into()),
+
+                &isa::Instruction::I32Eqz => self.run_eqz::<i32>(),
+                &isa::Instruction::I32Eq => self.run_eq::<i32>(),
+                &isa::Instruction::I32Ne => self.run_ne::<i32>(),
+                &isa::Instruction::I32LtS => self.run_lt::<i32>(),
+                &isa::Instruction::I32LtU => self.run_lt::<u32>(),
+                &isa::Instruction::I32GtS => self.run_gt::<i32>(),
+                &isa::Instruction::I32GtU => self.run_gt::<u32>(),
+                &isa::Instruction::I32LeS => self.run_lte::<i32>(),
+                &isa::Instruction::I32LeU => self.run_lte::<u32>(),
+                &isa::Instruction::I32GeS => self.run_gte::<i32>(),
+                &isa::Instruction::I32GeU => self.run_gte::<u32>(),
+
+                &isa::Instruction::I64Eqz => self.run_eqz::<i64>(),
+                &isa::Instruction::I64Eq => self.run_eq::<i64>(),
+                &isa::Instruction::I64Ne => self.run_ne::<i64>(),
+                &isa::Instruction::I64LtS => self.run_lt::<i64>(),
+                &isa::Instruction::I64LtU => self.run_lt::<u64>(),
+                &isa::Instruction::I64GtS => self.run_gt::<i64>(),
+                &isa::Instruction::I64GtU => self.run_gt::<u64>(),
+                &isa::Instruction::I64LeS => self.run_lte::<i64>(),
+                &isa::Instruction::I64LeU => self.run_lte::<u64>(),
+                &isa::Instruction::I64GeS => self.run_gte::<i64>(),
+                &isa::Instruction::I64GeU => self.run_gte::<u64>(),
+
+                &isa::Instruction::F32Eq => self.run_eq::<F32>(),
+                &isa::Instruction::F32Ne => self.run_ne::<F32>(),
+                &isa::Instruction::F32Lt => self.run_lt::<F32>(),
+                &isa::Instruction::F32Gt => self.run_gt::<F32>(),
+                &isa::Instruction::F32Le => self.run_lte::<F32>(),
+                &isa::Instruction::F32Ge => self.run_gte::<F32>(),
+
+                &isa::Instruction::F64Eq => self.run_eq::<F64>(),
+                &isa::Instruction::F64Ne => self.run_ne::<F64>(),
+                &isa::Instruction::F64Lt => self.run_lt::<F64>(),
+                &isa::Instruction::F64Gt => self.run_gt::<F64>(),
+                &isa::Instruction::F64Le => self.run_lte::<F64>(),
+                &isa::Instruction::F64Ge => self.run_gte::<F64>(),
+
+                &isa::Instruction::I32Clz => self.run_clz::<i32>(),
+                &isa::Instruction::I32Ctz => self.run_ctz::<i32>(),
+                &isa::Instruction::I32Popcnt => self.run_popcnt::<i32>(),
+                &isa::Instruction::I32Add => self.run_add::<i32>(),
+                &isa::Instruction::I32Sub => self.run_sub::<i32>(),
+                &isa::Instruction::I32Mul => self.run_mul::<i32>(),
+                &isa::Instruction::I32DivS => self.run_div::<i32, i32>(),
+                &isa::Instruction::I32DivU => self.run_div::<i32, u32>(),
+                &isa::Instruction::I32RemS => self.run_rem::<i32, i32>(),
+                &isa::Instruction::I32RemU => self.run_rem::<i32, u32>(),
+                &isa::Instruction::I32And => self.run_and::<i32>(),
+                &isa::Instruction::I32Or => self.run_or::<i32>(),
+                &isa::Instruction::I32Xor => self.run_xor::<i32>(),
+                &isa::Instruction::I32Shl => self.run_shl::<i32>(0x1F),
+                &isa::Instruction::I32ShrS => self.run_shr::<i32, i32>(0x1F),
+                &isa::Instruction::I32ShrU => self.run_shr::<i32, u32>(0x1F),
+                &isa::Instruction::I32Rotl => self.run_rotl::<i32>(),
+                &isa::Instruction::I32Rotr => self.run_rotr::<i32>(),
+
+                &isa::Instruction::I64Clz => self.run_clz::<i64>(),
+                &isa::Instruction::I64Ctz => self.run_ctz::<i64>(),
+                &isa::Instruction::I64Popcnt => self.run_popcnt::<i64>(),
+                &isa::Instruction::I64Add => self.run_add::<i64>(),
+                &isa::Instruction::I64Sub => self.run_sub::<i64>(),
+                &isa::Instruction::I64Mul => self.run_mul::<i64>(),
+                &isa::Instruction::I64DivS => self.run_div::<i64, i64>(),
+                &isa::Instruction::I64DivU => self.run_div::<i64, u64>(),
+                &isa::Instruction::I64RemS => self.run_rem::<i64, i64>(),
+                &isa::Instruction::I64RemU => self.run_rem::<i64, u64>(),
+                &isa::Instruction::I64And => self.run_and::<i64>(),
+                &isa::Instruction::I64Or => self.run_or::<i64>(),
+                &isa::Instruction::I64Xor => self.run_xor::<i64>(),
+                &isa::Instruction::I64Shl => self.run_shl::<i64>(0x3F),
+                &isa::Instruction::I64ShrS => self.run_shr::<i64, i64>(0x3F),
+                &isa::Instruction::I64ShrU => self.run_shr::<i64, u64>(0x3F),
+                &isa::Instruction::I64Rotl => self.run_rotl::<i64>(),
+                &isa::Instruction::I64Rotr => self.run_rotr::<i64>(),
+
+                &isa::Instruction::F32Abs => self.run_abs::<F32>(),
+                &isa::Instruction::F32Neg => self.run_neg::<F32>(),
+                &isa::Instruction::F32Ceil => self.run_ceil::<F32>(),
+                &isa::Instruction::F32Floor => self.run_floor::<F32>(),
+                &isa::Instruction::F32Trunc => self.run_trunc::<F32>(),
+                &isa::Instruction::F32Nearest => self.run_nearest::<F32>(),
+                &isa::Instruction::F32Sqrt => self.run_sqrt::<F32>(),
+                &isa::Instruction::F32Add => self.run_add::<F32>(),
+                &isa::Instruction::F32Sub => self.run_sub::<F32>(),
+                &isa::Instruction::F32Mul => self.run_mul::<F32>(),
+                &isa::Instruction::F32Div => self.run_div::<F32, F32>(),
+                &isa::Instruction::F32Min => self.run_min::<F32>(),
+                &isa::Instruction::F32Max => self.run_max::<F32>(),
+                &isa::Instruction::F32Copysign => self.run_copysign::<F32>(),
+
+                &isa::Instruction::F64Abs => self.run_abs::<F64>(),
+                &isa::Instruction::F64Neg => self.run_neg::<F64>(),
+                &isa::Instruction::F64Ceil => self.run_ceil::<F64>(),
+                &isa::Instruction::F64Floor => self.run_floor::<F64>(),
+                &isa::Instruction::F64Trunc => self.run_trunc::<F64>(),
+                &isa::Instruction::F64Nearest => self.run_nearest::<F64>(),
+                &isa::Instruction::F64Sqrt => self.run_sqrt::<F64>(),
+                &isa::Instruction::F64Add => self.run_add::<F64>(),
+                &isa::Instruction::F64Sub => self.run_sub::<F64>(),
+                &isa::Instruction::F64Mul => self.run_mul::<F64>(),
+                &isa::Instruction::F64Div => self.run_div::<F64, F64>(),
+                &isa::Instruction::F64Min => self.run_min::<F64>(),
+                &isa::Instruction::F64Max => self.run_max::<F64>(),
+                &isa::Instruction::F64Copysign => self.run_copysign::<F64>(),
+
+                &isa::Instruction::I32WrapI64 => self.run_wrap::<i64, i32>(),
+                &isa::Instruction::I32TruncSF32 => self.run_trunc_to_int::<F32, i32, i32>(),
+                &isa::Instruction::I32TruncUF32 => self.run_trunc_to_int::<F32, u32, i32>(),
+                &isa::Instruction::I32TruncSF64 => self.run_trunc_to_int::<F64, i32, i32>(),
+                &isa::Instruction::I32TruncUF64 => self.run_trunc_to_int::<F64, u32, i32>(),
+                &isa::Instruction::I64ExtendSI32 => self.run_extend::<i32, i64, i64>(),
+                &isa::Instruction::I64ExtendUI32 => self.run_extend::<u32, u64, i64>(),
+                &isa::Instruction::I64TruncSF32 => self.run_trunc_to_int::<F32, i64, i64>(),
+                &isa::Instruction::I64TruncUF32 => self.run_trunc_to_int::<F32, u64, i64>(),
+                &isa::Instruction::I64TruncSF64 => self.run_trunc_to_int::<F64, i64, i64>(),
+                &isa::Instruction::I64TruncUF64 => self.run_trunc_to_int::<F64, u64, i64>(),
+                &isa::Instruction::F32ConvertSI32 => self.run_extend::<i32, F32, F32>(),
+                &isa::Instruction::F32ConvertUI32 => self.run_extend::<u32, F32, F32>(),
+                &isa::Instruction::F32ConvertSI64 => self.run_wrap::<i64, F32>(),
+                &isa::Instruction::F32ConvertUI64 => self.run_wrap::<u64, F32>(),
+                &isa::Instruction::F32DemoteF64 => self.run_wrap::<F64, F32>(),
+                &isa::Instruction::F64ConvertSI32 => self.run_extend::<i32, F64, F64>(),
+                &isa::Instruction::F64ConvertUI32 => self.run_extend::<u32, F64, F64>(),
+                &isa::Instruction::F64ConvertSI64 => self.run_extend::<i64, F64, F64>(),
+                &isa::Instruction::F64ConvertUI64 => self.run_extend::<u64, F64, F64>(),
+                &isa::Instruction::F64PromoteF32 => self.run_extend::<F32, F64, F64>(),
+
+                &isa::Instruction::I32ReinterpretF32 => self.run_reinterpret::<F32, i32>(),
+                &isa::Instruction::I64ReinterpretF64 => self.run_reinterpret::<F64, i64>(),
+                &isa::Instruction::F32ReinterpretI32 => self.run_reinterpret::<i32, F32>(),
+                &isa::Instruction::F64ReinterpretI64 => self.run_reinterpret::<i64, F64>(),
             }
-            &isa::Instruction::I32Load8U(offset) => {
-                self.run_load_extend::<u8, i32>(context, offset)
-            }
-            &isa::Instruction::I32Load16S(offset) => {
-                self.run_load_extend::<i16, i32>(context, offset)
-            }
-            &isa::Instruction::I32Load16U(offset) => {
-                self.run_load_extend::<u16, i32>(context, offset)
-            }
-            &isa::Instruction::I64Load8S(offset) => {
-                self.run_load_extend::<i8, i64>(context, offset)
-            }
-            &isa::Instruction::I64Load8U(offset) => {
-                self.run_load_extend::<u8, i64>(context, offset)
-            }
-            &isa::Instruction::I64Load16S(offset) => {
-                self.run_load_extend::<i16, i64>(context, offset)
-            }
-            &isa::Instruction::I64Load16U(offset) => {
-                self.run_load_extend::<u16, i64>(context, offset)
-            }
-            &isa::Instruction::I64Load32S(offset) => {
-                self.run_load_extend::<i32, i64>(context, offset)
-            }
-            &isa::Instruction::I64Load32U(offset) => {
-                self.run_load_extend::<u32, i64>(context, offset)
-            }
-
-            &isa::Instruction::I32Store(offset) => self.run_store::<i32>(context, offset),
-            &isa::Instruction::I64Store(offset) => self.run_store::<i64>(context, offset),
-            &isa::Instruction::F32Store(offset) => self.run_store::<F32>(context, offset),
-            &isa::Instruction::F64Store(offset) => self.run_store::<F64>(context, offset),
-            &isa::Instruction::I32Store8(offset) => self.run_store_wrap::<i32, i8>(context, offset),
-            &isa::Instruction::I32Store16(offset) => {
-                self.run_store_wrap::<i32, i16>(context, offset)
-            }
-            &isa::Instruction::I64Store8(offset) => self.run_store_wrap::<i64, i8>(context, offset),
-            &isa::Instruction::I64Store16(offset) => {
-                self.run_store_wrap::<i64, i16>(context, offset)
-            }
-            &isa::Instruction::I64Store32(offset) => {
-                self.run_store_wrap::<i64, i32>(context, offset)
-            }
-
-            &isa::Instruction::CurrentMemory => self.run_current_memory(context),
-            &isa::Instruction::GrowMemory => self.run_grow_memory(context),
-
-            &isa::Instruction::I32Const(val) => self.run_const(val.into()),
-            &isa::Instruction::I64Const(val) => self.run_const(val.into()),
-            &isa::Instruction::F32Const(val) => self.run_const(val.into()),
-            &isa::Instruction::F64Const(val) => self.run_const(val.into()),
-
-            &isa::Instruction::I32Eqz => self.run_eqz::<i32>(),
-            &isa::Instruction::I32Eq => self.run_eq::<i32>(),
-            &isa::Instruction::I32Ne => self.run_ne::<i32>(),
-            &isa::Instruction::I32LtS => self.run_lt::<i32>(),
-            &isa::Instruction::I32LtU => self.run_lt::<u32>(),
-            &isa::Instruction::I32GtS => self.run_gt::<i32>(),
-            &isa::Instruction::I32GtU => self.run_gt::<u32>(),
-            &isa::Instruction::I32LeS => self.run_lte::<i32>(),
-            &isa::Instruction::I32LeU => self.run_lte::<u32>(),
-            &isa::Instruction::I32GeS => self.run_gte::<i32>(),
-            &isa::Instruction::I32GeU => self.run_gte::<u32>(),
-
-            &isa::Instruction::I64Eqz => self.run_eqz::<i64>(),
-            &isa::Instruction::I64Eq => self.run_eq::<i64>(),
-            &isa::Instruction::I64Ne => self.run_ne::<i64>(),
-            &isa::Instruction::I64LtS => self.run_lt::<i64>(),
-            &isa::Instruction::I64LtU => self.run_lt::<u64>(),
-            &isa::Instruction::I64GtS => self.run_gt::<i64>(),
-            &isa::Instruction::I64GtU => self.run_gt::<u64>(),
-            &isa::Instruction::I64LeS => self.run_lte::<i64>(),
-            &isa::Instruction::I64LeU => self.run_lte::<u64>(),
-            &isa::Instruction::I64GeS => self.run_gte::<i64>(),
-            &isa::Instruction::I64GeU => self.run_gte::<u64>(),
-
-            &isa::Instruction::F32Eq => self.run_eq::<F32>(),
-            &isa::Instruction::F32Ne => self.run_ne::<F32>(),
-            &isa::Instruction::F32Lt => self.run_lt::<F32>(),
-            &isa::Instruction::F32Gt => self.run_gt::<F32>(),
-            &isa::Instruction::F32Le => self.run_lte::<F32>(),
-            &isa::Instruction::F32Ge => self.run_gte::<F32>(),
-
-            &isa::Instruction::F64Eq => self.run_eq::<F64>(),
-            &isa::Instruction::F64Ne => self.run_ne::<F64>(),
-            &isa::Instruction::F64Lt => self.run_lt::<F64>(),
-            &isa::Instruction::F64Gt => self.run_gt::<F64>(),
-            &isa::Instruction::F64Le => self.run_lte::<F64>(),
-            &isa::Instruction::F64Ge => self.run_gte::<F64>(),
-
-            &isa::Instruction::I32Clz => self.run_clz::<i32>(),
-            &isa::Instruction::I32Ctz => self.run_ctz::<i32>(),
-            &isa::Instruction::I32Popcnt => self.run_popcnt::<i32>(),
-            &isa::Instruction::I32Add => self.run_add::<i32>(),
-            &isa::Instruction::I32Sub => self.run_sub::<i32>(),
-            &isa::Instruction::I32Mul => self.run_mul::<i32>(),
-            &isa::Instruction::I32DivS => self.run_div::<i32, i32>(),
-            &isa::Instruction::I32DivU => self.run_div::<i32, u32>(),
-            &isa::Instruction::I32RemS => self.run_rem::<i32, i32>(),
-            &isa::Instruction::I32RemU => self.run_rem::<i32, u32>(),
-            &isa::Instruction::I32And => self.run_and::<i32>(),
-            &isa::Instruction::I32Or => self.run_or::<i32>(),
-            &isa::Instruction::I32Xor => self.run_xor::<i32>(),
-            &isa::Instruction::I32Shl => self.run_shl::<i32>(0x1F),
-            &isa::Instruction::I32ShrS => self.run_shr::<i32, i32>(0x1F),
-            &isa::Instruction::I32ShrU => self.run_shr::<i32, u32>(0x1F),
-            &isa::Instruction::I32Rotl => self.run_rotl::<i32>(),
-            &isa::Instruction::I32Rotr => self.run_rotr::<i32>(),
-
-            &isa::Instruction::I64Clz => self.run_clz::<i64>(),
-            &isa::Instruction::I64Ctz => self.run_ctz::<i64>(),
-            &isa::Instruction::I64Popcnt => self.run_popcnt::<i64>(),
-            &isa::Instruction::I64Add => self.run_add::<i64>(),
-            &isa::Instruction::I64Sub => self.run_sub::<i64>(),
-            &isa::Instruction::I64Mul => self.run_mul::<i64>(),
-            &isa::Instruction::I64DivS => self.run_div::<i64, i64>(),
-            &isa::Instruction::I64DivU => self.run_div::<i64, u64>(),
-            &isa::Instruction::I64RemS => self.run_rem::<i64, i64>(),
-            &isa::Instruction::I64RemU => self.run_rem::<i64, u64>(),
-            &isa::Instruction::I64And => self.run_and::<i64>(),
-            &isa::Instruction::I64Or => self.run_or::<i64>(),
-            &isa::Instruction::I64Xor => self.run_xor::<i64>(),
-            &isa::Instruction::I64Shl => self.run_shl::<i64>(0x3F),
-            &isa::Instruction::I64ShrS => self.run_shr::<i64, i64>(0x3F),
-            &isa::Instruction::I64ShrU => self.run_shr::<i64, u64>(0x3F),
-            &isa::Instruction::I64Rotl => self.run_rotl::<i64>(),
-            &isa::Instruction::I64Rotr => self.run_rotr::<i64>(),
-
-            &isa::Instruction::F32Abs => self.run_abs::<F32>(),
-            &isa::Instruction::F32Neg => self.run_neg::<F32>(),
-            &isa::Instruction::F32Ceil => self.run_ceil::<F32>(),
-            &isa::Instruction::F32Floor => self.run_floor::<F32>(),
-            &isa::Instruction::F32Trunc => self.run_trunc::<F32>(),
-            &isa::Instruction::F32Nearest => self.run_nearest::<F32>(),
-            &isa::Instruction::F32Sqrt => self.run_sqrt::<F32>(),
-            &isa::Instruction::F32Add => self.run_add::<F32>(),
-            &isa::Instruction::F32Sub => self.run_sub::<F32>(),
-            &isa::Instruction::F32Mul => self.run_mul::<F32>(),
-            &isa::Instruction::F32Div => self.run_div::<F32, F32>(),
-            &isa::Instruction::F32Min => self.run_min::<F32>(),
-            &isa::Instruction::F32Max => self.run_max::<F32>(),
-            &isa::Instruction::F32Copysign => self.run_copysign::<F32>(),
-
-            &isa::Instruction::F64Abs => self.run_abs::<F64>(),
-            &isa::Instruction::F64Neg => self.run_neg::<F64>(),
-            &isa::Instruction::F64Ceil => self.run_ceil::<F64>(),
-            &isa::Instruction::F64Floor => self.run_floor::<F64>(),
-            &isa::Instruction::F64Trunc => self.run_trunc::<F64>(),
-            &isa::Instruction::F64Nearest => self.run_nearest::<F64>(),
-            &isa::Instruction::F64Sqrt => self.run_sqrt::<F64>(),
-            &isa::Instruction::F64Add => self.run_add::<F64>(),
-            &isa::Instruction::F64Sub => self.run_sub::<F64>(),
-            &isa::Instruction::F64Mul => self.run_mul::<F64>(),
-            &isa::Instruction::F64Div => self.run_div::<F64, F64>(),
-            &isa::Instruction::F64Min => self.run_min::<F64>(),
-            &isa::Instruction::F64Max => self.run_max::<F64>(),
-            &isa::Instruction::F64Copysign => self.run_copysign::<F64>(),
-
-            &isa::Instruction::I32WrapI64 => self.run_wrap::<i64, i32>(),
-            &isa::Instruction::I32TruncSF32 => self.run_trunc_to_int::<F32, i32, i32>(),
-            &isa::Instruction::I32TruncUF32 => self.run_trunc_to_int::<F32, u32, i32>(),
-            &isa::Instruction::I32TruncSF64 => self.run_trunc_to_int::<F64, i32, i32>(),
-            &isa::Instruction::I32TruncUF64 => self.run_trunc_to_int::<F64, u32, i32>(),
-            &isa::Instruction::I64ExtendSI32 => self.run_extend::<i32, i64, i64>(),
-            &isa::Instruction::I64ExtendUI32 => self.run_extend::<u32, u64, i64>(),
-            &isa::Instruction::I64TruncSF32 => self.run_trunc_to_int::<F32, i64, i64>(),
-            &isa::Instruction::I64TruncUF32 => self.run_trunc_to_int::<F32, u64, i64>(),
-            &isa::Instruction::I64TruncSF64 => self.run_trunc_to_int::<F64, i64, i64>(),
-            &isa::Instruction::I64TruncUF64 => self.run_trunc_to_int::<F64, u64, i64>(),
-            &isa::Instruction::F32ConvertSI32 => self.run_extend::<i32, F32, F32>(),
-            &isa::Instruction::F32ConvertUI32 => self.run_extend::<u32, F32, F32>(),
-            &isa::Instruction::F32ConvertSI64 => self.run_wrap::<i64, F32>(),
-            &isa::Instruction::F32ConvertUI64 => self.run_wrap::<u64, F32>(),
-            &isa::Instruction::F32DemoteF64 => self.run_wrap::<F64, F32>(),
-            &isa::Instruction::F64ConvertSI32 => self.run_extend::<i32, F64, F64>(),
-            &isa::Instruction::F64ConvertUI32 => self.run_extend::<u32, F64, F64>(),
-            &isa::Instruction::F64ConvertSI64 => self.run_extend::<i64, F64, F64>(),
-            &isa::Instruction::F64ConvertUI64 => self.run_extend::<u64, F64, F64>(),
-            &isa::Instruction::F64PromoteF32 => self.run_extend::<F32, F64, F64>(),
-
-            &isa::Instruction::I32ReinterpretF32 => self.run_reinterpret::<F32, i32>(),
-            &isa::Instruction::I64ReinterpretF64 => self.run_reinterpret::<F64, i64>(),
-            &isa::Instruction::F32ReinterpretI32 => self.run_reinterpret::<i32, F32>(),
-            &isa::Instruction::F64ReinterpretI64 => self.run_reinterpret::<i64, F64>(),
         }
     }
 
